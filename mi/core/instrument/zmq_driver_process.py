@@ -24,8 +24,9 @@ import time
 import logging
 import sys
 import uuid
-
+import pika
 import zmq
+import json
 
 from ooi.exception import ApplicationException
 from mi.core.exceptions import InstrumentException, UnexpectedError
@@ -122,7 +123,15 @@ class ZmqDriverProcess(driver_process.DriverProcess):
         self.stop_evt_thread = True
         self.cmd_thread = None
         self.stop_cmd_thread = True
-        
+        self.driver_module = driver_module
+
+    def publish_amqp(self, key, message):
+        connection = pika.BlockingConnection(pika.ConnectionParameters(host='localhost'))
+        channel = connection.channel()
+        channel.exchange_declare(exchange='particle_data', type='topic')
+        channel.basic_publish(exchange='particle_data', routing_key=key, body=json.dumps(message))
+        connection.close()
+ 
     def start_messaging(self):
         """
         Initialize and start messaging resources for the driver, blocking
@@ -133,7 +142,7 @@ class ZmqDriverProcess(driver_process.DriverProcess):
         """
         def recv_cmd_msg(zmq_driver_process):
             """
-            Await commands on a ZMQ REP socket, forwaring them to the
+            Await commands on a ZMQ REP socket, forwarding them to the
             driver for processing and returning the result.
             """
             context = zmq.Context()
@@ -146,7 +155,7 @@ class ZmqDriverProcess(driver_process.DriverProcess):
             zmq_driver_process.stop_cmd_thread = False
             while not zmq_driver_process.stop_cmd_thread:
                 try:
-                    msg = sock.recv_pyobj(flags=zmq.NOBLOCK)
+                    msg = sock.recv_json(flags=zmq.NOBLOCK)
                     #log.trace('Processing message %s', msg)
                     reply = zmq_driver_process.cmd_driver(msg)
                     # if operation raised exception, encode as triple
@@ -155,7 +164,7 @@ class ZmqDriverProcess(driver_process.DriverProcess):
                     # send, send, and resend
                     while True:
                         try:
-                            sock.send_pyobj(reply, flags=zmq.NOBLOCK)
+                            sock.send_json(reply, flags=zmq.NOBLOCK)
                             break
                         except zmq.ZMQError:
                             time.sleep(.1)
@@ -171,7 +180,7 @@ class ZmqDriverProcess(driver_process.DriverProcess):
         def send_evt_msg(zmq_driver_process):
             """
             Await events on the driver process event queue and publish them
-            on a ZMQ PUB socket to the driver process client.
+            on a ZMQ PUB socket to the driver process client and to AMQP
             """
             context = zmq.Context()
             sock = context.socket(zmq.PUB)
@@ -188,7 +197,8 @@ class ZmqDriverProcess(driver_process.DriverProcess):
                         try:
                             if isinstance(evt, Exception):
                                 evt = _encode_exception(evt)
-                            sock.send_pyobj(evt, flags=zmq.NOBLOCK)
+                            sock.send_json(evt, flags=zmq.NOBLOCK)
+                            self.publish_amqp(self.driver_module, evt)
                             evt = None
                             log.trace('Event sent!')
                         except zmq.ZMQError:
@@ -196,6 +206,9 @@ class ZmqDriverProcess(driver_process.DriverProcess):
                             if zmq_driver_process.stop_evt_thread:
                                 break
                 except IndexError:
+                    time.sleep(.1)
+                except Exception as e:
+                    log.debug("Exception in event loop: %s", e)
                     time.sleep(.1)
 
             sock.close()
